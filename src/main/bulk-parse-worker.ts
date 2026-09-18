@@ -1,5 +1,6 @@
 import { parentPort, workerData } from 'node:worker_threads';
-import { get as httpsGet, type IncomingMessage } from 'node:https';
+import { get as httpsGet } from 'node:https';
+import type { IncomingMessage } from 'node:http';
 import { createGunzip } from 'node:zlib';
 import { createInterface } from 'node:readline';
 import type { ScryfallBulkCard } from './scryfall-bootstrap.js';
