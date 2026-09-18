@@ -8,11 +8,29 @@ const ACCEPT = 'application/json';
 
 const BULK_DATA_BASE = 'https://api.scryfall.com/bulk-data';
 
+/**
+ * Internal, normalised manifest shape used by the rest of Mimir.
+ *
+ * Scryfall migrated bulk card exports in July 2026 from a JSON-array
+ * `download_uri` to gzip-compressed JSONL exposed as
+ * `jsonl_download_uri`. We normalise both API generations to the legacy
+ * field names here so the bootstrap orchestration does not need to care which
+ * Scryfall generation it is talking to.
+ */
 export interface BulkDataManifest {
   type: string;
   download_uri: string;
   updated_at: string;
   size: number;
+}
+
+interface RawBulkDataManifest {
+  type?: string;
+  updated_at?: string;
+  download_uri?: string;
+  jsonl_download_uri?: string;
+  size?: number;
+  compressed_size?: number;
 }
 
 export interface HttpError extends Error {
@@ -44,13 +62,28 @@ export async function fetchBulkDataManifest(
       parseRetryAfter(res),
     );
   }
-  const data = (await res.json()) as BulkDataManifest;
-  if (!data.download_uri) {
-    throw new Error('Scryfall bulk-data manifest missing download_uri');
+
+  const data = (await res.json()) as RawBulkDataManifest;
+  const downloadUri = data.jsonl_download_uri ?? data.download_uri;
+  if (!downloadUri) {
+    throw new Error(
+      'Scryfall bulk-data manifest missing jsonl_download_uri/download_uri',
+    );
   }
-  return data;
+
+  return {
+    type: data.type ?? bulkType,
+    download_uri: downloadUri,
+    updated_at: data.updated_at ?? '',
+    size: data.compressed_size ?? data.size ?? 0,
+  };
 }
 
+/**
+ * Legacy helper retained for tests and callers that explicitly provide an old
+ * JSON-array bulk URI. The application bootstrap uses downloadBulkJson(), whose
+ * worker supports both the current .jsonl.gz format and the old JSON array.
+ */
 export async function fetchBulkData(
   downloadUri: string,
   fetchImpl: typeof fetch = fetch,
@@ -72,10 +105,11 @@ export async function fetchBulkData(
 
 export type DownloadProgressFn = (downloadedBytes: number, totalBytes: number | null) => void;
 
-// Spawns a Worker thread that downloads and parses the bulk JSON off the main
-// thread entirely. The worker byte-scans the raw Buffer (no 512 MB string
-// limit) and streams parsed cards back in batches so the main thread stays
-// responsive throughout.
+// Spawns a Worker thread so downloading, gzip decompression and bulk parsing
+// stay off the Electron main thread. The worker accepts both:
+//   - current Scryfall gzip-compressed JSONL (.jsonl.gz)
+//   - legacy Scryfall JSON arrays (.json)
+// Cards are posted back in batches so the renderer remains responsive.
 export function downloadBulkJson(
   downloadUri: string,
   onProgress?: DownloadProgressFn,
@@ -86,6 +120,19 @@ export function downloadBulkJson(
     });
 
     const allCards: ScryfallBulkCard[] = [];
+    let settled = false;
+
+    const resolveOnce = (): void => {
+      if (settled) return;
+      settled = true;
+      resolve(allCards);
+    };
+
+    const rejectOnce = (err: Error): void => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    };
 
     worker.on('message', (msg: WorkerMsg) => {
       switch (msg.type) {
@@ -96,19 +143,21 @@ export function downloadBulkJson(
           for (const card of msg.cards) allCards.push(card);
           break;
         case 'done':
-          resolve(allCards);
-          worker.terminate();
+          resolveOnce();
+          void worker.terminate();
           break;
         case 'error':
-          reject(httpError(msg.message, msg.status ?? 0));
-          worker.terminate();
+          rejectOnce(httpError(msg.message, msg.status ?? 0));
+          void worker.terminate();
           break;
       }
     });
 
-    worker.on('error', reject);
+    worker.on('error', rejectOnce);
     worker.on('exit', (code) => {
-      if (code !== 0) reject(new Error(`Bulk-parse worker exited with code ${code}`));
+      if (!settled && code !== 0) {
+        rejectOnce(new Error(`Bulk-parse worker exited with code ${code}`));
+      }
     });
   });
 }
@@ -118,16 +167,6 @@ type WorkerMsg =
   | { type: 'cards'; cards: ScryfallBulkCard[] }
   | { type: 'done' }
   | { type: 'error'; message: string; status?: number };
-
-function parseRetryAfterHeader(header: string | string[] | undefined): number | undefined {
-  const raw = Array.isArray(header) ? header[0] : header;
-  if (!raw) return undefined;
-  const seconds = Number(raw);
-  if (Number.isFinite(seconds)) return seconds * 1000;
-  const date = Date.parse(raw);
-  if (Number.isFinite(date)) return Math.max(0, date - Date.now());
-  return undefined;
-}
 
 function parseRetryAfter(res: Response): number | undefined {
   const header = res.headers?.get?.('Retry-After');
