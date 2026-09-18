@@ -7,7 +7,7 @@ import {
   SCRYFALL_USER_AGENT,
 } from '../src/main/scryfall-bulk.js';
 
-function manifestResponse(): typeof fetch {
+function legacyManifestResponse(): typeof fetch {
   return vi.fn(async (url: string) => {
     if (String(url).endsWith('/bulk-data/default-cards')) {
       return {
@@ -26,13 +26,78 @@ function manifestResponse(): typeof fetch {
   }) as unknown as typeof fetch;
 }
 
+function jsonlManifestResponse(): typeof fetch {
+  return vi.fn(async (url: string) => {
+    if (String(url).endsWith('/bulk-data/default-cards')) {
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          object: 'bulk_data',
+          type: 'default_cards',
+          jsonl_download_uri:
+            'https://data.scryfall.io/default-cards/default-cards-20260918.jsonl.gz',
+          updated_at: '2026-09-18T09:00:00.000Z',
+          compressed_size: 987654,
+        }),
+      } as Response;
+    }
+    throw new Error(`unexpected url: ${url}`);
+  }) as unknown as typeof fetch;
+}
+
 describe('fetchBulkDataManifest', () => {
-  it('hits the default-cards bulk endpoint and returns the manifest', async () => {
-    const fetchImpl = manifestResponse();
+  it('normalises the current Scryfall JSONL manifest', async () => {
+    const fetchImpl = jsonlManifestResponse();
     const manifest = await fetchBulkDataManifest('default_cards', fetchImpl);
     expect(manifest.type).toBe('default_cards');
+    expect(manifest.download_uri).toMatch(/default-cards-20260918\.jsonl\.gz/);
+    expect(manifest.size).toBe(987654);
+  });
+
+  it('keeps compatibility with the legacy download_uri manifest', async () => {
+    const fetchImpl = legacyManifestResponse();
+    const manifest = await fetchBulkDataManifest('default_cards', fetchImpl);
     expect(manifest.download_uri).toMatch(/default-cards\.json/);
     expect(manifest.size).toBe(1234);
+  });
+
+  it('prefers jsonl_download_uri if both generations are present', async () => {
+    const fetchImpl = vi.fn(async () =>
+      ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          type: 'default_cards',
+          download_uri: 'https://example.invalid/old.json',
+          jsonl_download_uri: 'https://example.invalid/current.jsonl.gz',
+          updated_at: '2026-09-18T09:00:00.000Z',
+          size: 100,
+          compressed_size: 50,
+        }),
+      }) as Response,
+    ) as unknown as typeof fetch;
+
+    const manifest = await fetchBulkDataManifest('default_cards', fetchImpl);
+    expect(manifest.download_uri).toBe('https://example.invalid/current.jsonl.gz');
+    expect(manifest.size).toBe(50);
+  });
+
+  it('fails clearly when neither download URI is provided', async () => {
+    const fetchImpl = vi.fn(async () =>
+      ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          type: 'default_cards',
+          updated_at: '2026-09-18T09:00:00.000Z',
+        }),
+      }) as Response,
+    ) as unknown as typeof fetch;
+
+    await expect(
+      fetchBulkDataManifest('default_cards', fetchImpl),
+    ).rejects.toThrow(/jsonl_download_uri\/download_uri/);
   });
 
   it('sends the descriptive User-Agent', async () => {
@@ -46,9 +111,9 @@ describe('fetchBulkDataManifest', () => {
         json: async () => ({
           object: 'bulk_data',
           type: 'default_cards',
-          download_uri: 'https://data.scryfall.io/x.json',
+          jsonl_download_uri: 'https://data.scryfall.io/x.jsonl.gz',
           updated_at: '',
-          size: 0,
+          compressed_size: 0,
         }),
       } as Response;
     }) as unknown as typeof fetch;
@@ -59,7 +124,7 @@ describe('fetchBulkDataManifest', () => {
 });
 
 describe('fetchBulkData', () => {
-  it('downloads and parses the JSON array of cards', async () => {
+  it('downloads and parses a legacy JSON array of cards', async () => {
     const fetchImpl = vi.fn(async () =>
       ({
         ok: true,
